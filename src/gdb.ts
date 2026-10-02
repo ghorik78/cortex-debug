@@ -10,7 +10,7 @@ import {
     StackFrame, Scope, Source, Handles, Event, ErrorDestination
 } from '@vscode/debugadapter';
 import { DebugProtocol } from '@vscode/debugprotocol';
-import { MI2, parseReadMemResults } from './backend/mi2/mi2';
+import { MI2, parseReadMemResults, escape } from './backend/mi2/mi2';
 import { extractBits, hexFormat } from './frontend/utils';
 import { Variable, VariableObject, MIError, OurDataBreakpoint, OurInstructionBreakpoint, OurSourceBreakpoint } from './backend/backend';
 import {
@@ -21,6 +21,7 @@ import {
 import { GDBServer, getServerLogFilePath, ServerConsoleLog } from './backend/server';
 import { MINode } from './backend/mi_parse';
 import { expandValue, isExpandable } from './backend/gdb_expansion';
+import { isExpressibleName, isPlainIdentifier, isSafeGdbVarName, splitQualifiedName, toDebugInfoName } from './backend/cxx_names';
 import { GdbDisassembler } from './backend/disasm';
 import * as os from 'os';
 import * as path from 'path';
@@ -2549,7 +2550,8 @@ export class GDBDebugSession extends LoggingDebugSession {
         return undefined;
     }
 
-    protected dataBreakpointInfoRequest(response: DebugProtocol.DataBreakpointInfoResponse, args: DebugProtocol.DataBreakpointInfoArguments): void {
+    protected async dataBreakpointInfoRequest(
+        response: DebugProtocol.DataBreakpointInfoResponse, args: DebugProtocol.DataBreakpointInfoArguments): Promise<void> {
         response.body = {
             dataId: null,
             description: 'cannot break on data access',
@@ -2560,15 +2562,45 @@ export class GDBDebugSession extends LoggingDebugSession {
         const ref = args.variablesReference;
         if ((ref !== undefined) && args.name && !((ref >= HandleRegions.REG_HANDLE_START) && (ref <= HandleRegions.REG_HANDLE_FINISH))) {
             const id = this.variableHandles.get(ref);
-            response.body.canPersist = !!this.isVarRefGlobalOrStatic(ref, id);
+            const isGlobalOrStatic = !!this.isVarRefGlobalOrStatic(ref, id);
+            response.body.canPersist = isGlobalOrStatic;
             const parentObj = id as VariableObject;
-            const fullName = (parentObj ? (parentObj.fullExp || parentObj.exp) + '.' : '') + args.name;
+            let fullName = (parentObj ? (parentObj.fullExp || parentObj.exp) + '.' : '') + args.name;
+            if (!parentObj) {
+                // For globals and statics, what we show is not always the expression that gdb needs
+                fullName = this.getFloatingVariable(ref, args.name)?.exp || fullName;
+            }
             response.body.dataId = fullName;
             response.body.description = fullName;       // What is displayed in the Breakpoints window
             response.body.accessTypes = ['read', 'write', 'readWrite'];
+            if (isGlobalOrStatic && fullName.includes('<') && !fullName.startsWith('\'') && !this.isBusy()) {
+                // If gdb finds a static member of a class template via the type of the class, as opposed to a quoted
+                // symbol name, it refuses to watch it ('Cannot watch constant value'). It has no problem watching the
+                // same thing by address. But, the address can change with the next build, so do not persist it
+                const addrExpr = await this.getAddressExpression(fullName);
+                if (addrExpr) {
+                    response.body.dataId = addrExpr;
+                    response.body.canPersist = false;
+                }
+            }
         }
 
         this.sendResponse(response);
+    }
+
+    // For an expression that has an address, returns an equivalent expression like '*(int *)0x20000010'
+    private async getAddressExpression(expr: string): Promise<string> {
+        try {
+            // A variable object is the way to get both the type and the value of '&expr' from gdb
+            const result = await this.miDebugger.sendCommand(`var-create - @ "&(${escape(expr)})"`);
+            await this.miDebugger.sendCommand(`var-delete ${result.result('name')}`);
+            // The value looks like '0x20000010 <ns::Pool<int, 8u>::count>' and the type like 'uint32_t *'
+            const match = /^0x[0-9a-f]+/i.exec(result.result('value') || '');
+            const type: string = result.result('type') || '';
+            return (match && type.includes('*')) ? `*(${type})${match[0]}` : '';
+        } catch {
+            return '';
+        }
     }
 
     protected setDataBreakpointsRequest(
@@ -2956,9 +2988,13 @@ export class GDBDebugSession extends LoggingDebugSession {
         this.sendResponse(response);
     }
 
+    // symOrExpr can be a list of expressions for a floating (global/static) variable, when we cannot be sure
+    // which one gdb is going to accept. They are tried in order when the variable gets created
     private async updateOrCreateVariable(
-        displayName: string | undefined, symOrExpr: string, gdbVarName: string, parentVarReference: number,
+        displayName: string | undefined, symOrExpr: string | string[], gdbVarName: string, parentVarReference: number,
         threadId: number, frameId: number, isFloating: boolean): Promise<DebugProtocol.Variable> {
+        const exprs = Array.isArray(symOrExpr) ? symOrExpr : [symOrExpr];
+        symOrExpr = exprs[0];
         try {
             let varObj: VariableObject | undefined;
             let varId = this.variableHandlesReverse.get(gdbVarName);
@@ -2999,12 +3035,12 @@ export class GDBDebugSession extends LoggingDebugSession {
                 if (createNewVar || (updateError instanceof MIError && updateError.message === VarNotFoundMsg)) {
                     // Create variable in current frame/thread context. Matters when we have to set the variable
                     if (isFloating) {
-                        varObj = await this.miDebugger.varCreate(parentVarReference, symOrExpr, gdbVarName, '@');
+                        varObj = await this.createFloatingVariable(parentVarReference, exprs, gdbVarName);
                     } else {
                         varObj = await this.miDebugger.varCreate(parentVarReference, symOrExpr, gdbVarName, '@', threadId, frameId);
+                        varObj.exp = symOrExpr;
                     }
                     varId = this.findOrCreateVariable(varObj);
-                    varObj.exp = symOrExpr;
                     varObj.id = varId;
                 } else if (!varObj) {
                     throw updateError || new Error('updateOrCreateVariable: unknown error');
@@ -3022,12 +3058,13 @@ export class GDBDebugSession extends LoggingDebugSession {
             }
 
             if (isFloating && varObj) {
-                this.putFloatingVariable(parentVarReference, symOrExpr, varObj);
+                // The expression can change if the variable had to be created again, what we display does not
+                this.putFloatingVariable(parentVarReference, displayName || varObj.exp, varObj);
             }
             return varObj.toProtocolVariable(displayName || varObj.name);
         } catch (err) {
             const ret: DebugProtocol.Variable = {
-                name: symOrExpr,
+                name: displayName || symOrExpr,
                 value: `<${err}>`,
                 variablesReference: 0
             };
@@ -3035,13 +3072,40 @@ export class GDBDebugSession extends LoggingDebugSession {
         }
     }
 
+    // Returns the first of the expressions that gdb can make sense of, as a variable object
+    private async createFloatingVariable(parentVarReference: number, exprs: string[], gdbVarName: string): Promise<VariableObject> {
+        let error: any;
+        for (const expr of exprs) {
+            try {
+                const varObj = await this.miDebugger.varCreate(parentVarReference, expr, gdbVarName, '@');
+                if (!MI2.hasNoDebugInfo(varObj.type) || isPlainIdentifier(expr)) {
+                    varObj.exp = expr;
+                    return varObj;
+                }
+                // gdb only found it in the ELF symbol table, so it has neither a type nor a value. It happens with
+                // static variables of functions that only exist inlined: there is no way to name them in gdb
+                error = new Error('gdb cannot find debug information for this variable');
+                await this.miDebugger.sendCommand(`var-delete ${gdbVarName}`);
+            } catch (err) {
+                error = err;
+            }
+        }
+        throw error;
+    }
+
+    // Name of a gdb variable object for a symbol. C++ names can have spaces, quotes and what not
+    private static gdbVarNameForSymbol(name: string): string {
+        return isSafeGdbVarName(name) ? name : crypto.createHash('sha256').update(name).digest('hex');
+    }
+
     private async globalVariablesRequest(response: DebugProtocol.VariablesResponse, args: DebugProtocol.VariablesArguments): Promise<void> {
-        const symbolInfo: SymbolInformation[] = this.symbolTable.getGlobalVariables();
         const globals: DebugProtocol.Variable[] = [];
         try {
+            const symbolInfo: SymbolInformation[] = await this.symbolTable.getAllGlobalVariables();
             for (const symbol of symbolInfo) {
-                const varObjName = `global_var_${symbol.name}`;
-                const tmp = await this.updateOrCreateVariable(symbol.name, symbol.name, varObjName, args.variablesReference, -1, -1, true);
+                const varObjName = `global_var_${GDBDebugSession.gdbVarNameForSymbol(symbol.name)}`;
+                const exprs = this.symbolTable.getGdbExpressions(symbol);
+                const tmp = await this.updateOrCreateVariable(symbol.name, exprs, varObjName, args.variablesReference, -1, -1, true);
                 globals.push(tmp);
             }
 
@@ -3053,8 +3117,36 @@ export class GDBDebugSession extends LoggingDebugSession {
     }
 
     private createStaticVarName(fHash: string, name: string): string {
-        const varObjName = `static_var_${name}_${fHash}`;
+        const varObjName = `static_var_${GDBDebugSession.gdbVarNameForSymbol(name)}_${fHash}`;
         return varObjName;
+    }
+
+    // If the function is a member of a class, returns the name of that class. But only if the class has static
+    // member variables, which is all we care about
+    private classNameCache = new Map<string, boolean>();
+    private async getClassOfFunction(func: string, threadId: number, frameId: number): Promise<string> {
+        const qualifier = splitQualifiedName(func || '')[0];
+        if (!qualifier || !(await this.symbolTable.hasVariablesWithQualifier(qualifier))) {
+            return '';
+        }
+        let isClass = this.classNameCache.get(qualifier);
+        if (isClass === undefined) {
+            const names = isExpressibleName(qualifier) ? [toDebugInfoName(qualifier), `'${qualifier}'`] : [`'${qualifier}'`];
+            for (const name of names) {
+                try {
+                    // It could also be a namespace which, to gdb, is a type as well. But one of size zero. Has to be
+                    // asked in the context of the frame, where the language is the one the function is written in
+                    const thFr = MI2.getThreadFrameStr(threadId, frameId);
+                    const result = await this.miDebugger.sendCommand(`data-evaluate-expression ${thFr} "sizeof(${name})"`);
+                    isClass = parseInt(result.result('value')) > 0;
+                    this.classNameCache.set(qualifier, isClass);
+                    break;
+                } catch {
+                    // Try the next spelling
+                }
+            }
+        }
+        return isClass ? qualifier : '';
     }
 
     /*
@@ -3089,25 +3181,19 @@ export class GDBDebugSession extends LoggingDebugSession {
         const statics: DebugProtocol.Variable[] = [];
         try {
             const frame = await this.miDebugger.getFrame(threadId, frameId);
-            let file = frame.file; // Prefer full path name first
-            let staticNames = file ? await this.symbolTable.getStaticVariableNames(file) : null;
-            if (!staticNames) {
-                file = frame.fileName;
-                staticNames = file ? await this.symbolTable.getStaticVariableNames(file) : [];
-            }
+            const file = frame.file || frame.fileName; // Prefer full path name first
+            const className = await this.getClassOfFunction(frame.function, threadId, frameId);
+            const symbols = await this.symbolTable.getStaticScopeVariables(file, className);
 
             const hasher = crypto.createHash('sha256');
             hasher.update(file || '');
             const fHash = hasher.digest('hex');
 
-            if (os.platform() === 'win32') {
-                file = file.replace(/\\/g, '/');
-            }
-
-            for (const displayName of staticNames) {
-                const exprName = `'${file}'::${displayName}`;
+            for (const symbol of symbols) {
+                const displayName = symbol.name;
+                const exprs = this.symbolTable.getGdbExpressions(symbol, file);
                 const varObjName = this.createStaticVarName(fHash, displayName);
-                const tmp = await this.updateOrCreateVariable(displayName, exprName, varObjName, args.variablesReference, threadId, frameId, true);
+                const tmp = await this.updateOrCreateVariable(displayName, exprs, varObjName, args.variablesReference, threadId, frameId, true);
                 statics.push(tmp);
             }
 

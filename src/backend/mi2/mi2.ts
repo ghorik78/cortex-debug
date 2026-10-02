@@ -10,6 +10,7 @@ import * as os from 'os';
 import { ServerConsoleLog } from '../server';
 import { hexFormat } from '../../frontend/utils';
 import { ADAPTER_DEBUG_MODE, GDBInterruptMode } from '../../common';
+import { getSymbolNameFromExpression, makeInfoVariablesRegex } from '../cxx_names';
 const path = posix;
 
 export interface ReadMemResults {
@@ -776,7 +777,8 @@ export class MI2 extends EventEmitter implements IBackend {
                 }
             }
 
-            bkptArgs += breakpoint.dataId;
+            // Expressions for C++ variables can have spaces and quotes
+            bkptArgs += /[\s'"]/.test(breakpoint.dataId) ? `"${escape(breakpoint.dataId)}"` : breakpoint.dataId;
             const aType = breakpoint.accessType === 'read' ? '-r' : (breakpoint.accessType === 'readWrite' ? '-a' : '');
             this.sendCommand(`break-watch ${aType} ${bkptArgs}`).then((result) => {
                 if (result.resultRecords.resultClass === 'done') {
@@ -956,7 +958,20 @@ export class MI2 extends EventEmitter implements IBackend {
 
         const [expr, fmt] = this.getExprAndFmt(expression);
         const thFr = ((threadId !== undefined) && (frameId !== undefined)) ? `--thread ${threadId} --frame ${frameId}` : '';
-        const createResp = await this.sendCommand(`var-create ${thFr} ${name} ${scope} "${expr}"`);
+        const createCmd = `var-create ${thFr} ${name} ${scope} "${expr}"`;
+        let createResp: MINode;
+        try {
+            createResp = await this.sendCommand(createCmd);
+            if (MI2.hasNoDebugInfo(createResp.result('type')) && await this.loadDebugInfoForSymbol(expression)) {
+                await this.sendCommand(`var-delete ${createResp.result('name')}`);
+                createResp = await this.sendCommand(createCmd);
+            }
+        } catch (e) {
+            if (!(await this.loadDebugInfoForSymbol(expression))) {
+                throw e;
+            }
+            createResp = await this.sendCommand(createCmd);
+        }
         let overrideVal: string = null;
         if (fmt && name !== '-') {
             const formatResp = await this.sendCommand(`var-set-format ${name} ${MI2.FORMAT_SPEC_MAP[fmt]}`);
@@ -968,6 +983,51 @@ export class MI2 extends EventEmitter implements IBackend {
             result = result.map((r: string[]) => r[0] === 'value' ? ['value', overrideVal] : r);
         }
         return new VariableObject(parent, result);
+    }
+
+    // What gdb reports as a type when a symbol is only known from the ELF symbol table
+    public static hasNoDebugInfo(type: string): boolean {
+        return !!type && type.includes('no debug info');
+    }
+
+    /*
+    // gdb reads debug info lazily, a compilation unit at a time, when it needs something that its lookup tables say
+    // should be there. Those tables are made of names as found in the debug info. With C++ templates, that may not
+    // be how the name of a symbol is spelled when demangled (Pool<int, 8> vs. Pool<int, 8u>) and variable templates
+    // are listed without template arguments. As a result, gdb cannot find a variable that it would have found if it
+    // had read the right compilation unit for some other reason. So, when an expression that is just a reference to
+    // such a symbol fails, we have gdb search for it the hard way, which also reads the debug info it lives in.
+    // This is also why such variables seem to work at times and not at others: it depends on where you have been
+    //
+    // Returns true if that was done, which should be only once per symbol, and it is worth trying again
+    */
+    private debugInfoLoadsTried = new Set<string>();
+    private async loadDebugInfoForSymbol(expression: string): Promise<boolean> {
+        const symName = getSymbolNameFromExpression(expression);
+        if (!symName) {
+            return false;
+        }
+        const regex = makeInfoVariablesRegex(symName);
+        if (this.debugInfoLoadsTried.has(regex)) {
+            return false;
+        }
+        this.debugInfoLoadsTried.add(regex);
+        try {
+            await this.sendCommand(`interpreter-exec console "info variables ${escape(regex)}"`, false, true);
+        } catch {
+            return false;
+        }
+        // gdb also remembers what it could not find and would not look again, even though it has more debug info now
+        try {
+            await this.sendCommand('interpreter-exec console "maint flush symbol-cache"', false, true);
+        } catch {
+            try {
+                await this.sendCommand('interpreter-exec console "maint flush-symbol-cache"', false, true);    // gdb 10 and older
+            } catch {
+                // Not fatal. We may still get lucky
+            }
+        }
+        return true;
     }
 
     public async varEvalExpression(name: string): Promise<MINode> {

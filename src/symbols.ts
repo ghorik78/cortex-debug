@@ -24,6 +24,7 @@ export interface SymbolInformation {
     type: SymbolType;
     scope: SymbolScope;
     isStatic: boolean;
+    isWeak?: boolean;             // Weak or unique-global. C++ uses these for things that can be defined in many object files
     // line?: number;                // Only available when using nm
     instructions: DisassemblyInstruction[];
     hidden: boolean;

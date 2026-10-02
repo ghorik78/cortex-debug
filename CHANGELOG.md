@@ -1,5 +1,16 @@
 # ChangeLog
 
+# V1.13.0-pre11
+* C++ `static` variables are now shown in the Variables panel. This covers everything the compiler emits as a weak (or unique) symbol and that we used to skip: `static inline` class members, static members of class templates, `inline` variables, variable templates and static locals of inline/template functions.
+  * `Global` scope lists them along with the other globals.
+  * `Static` scope lists the static members of the class that the function of the selected stack frame belongs to (wherever they are defined) first, followed by the statics of the file as before, followed by the variables listed above that are defined in the file. The latter is what you see when stopped in a template or inline function that lives in a header, where this scope used to be empty.
+* C++ variables in the `Global` and `Static` scopes are now looked up by their (quoted) symbol name. They no longer turn into errors when you are stopped in a C function, where gdb switches to the C language and does not understand `ns::Class::member`. Names with spaces and other special characters (`ns::Pool<int, 8u>::count`, `ns::(anonymous namespace)::var`) no longer break the creation of gdb variable objects.
+* GDB could not find some C++ variables depending on which parts of the debug information it had read so far, typically variable templates and static members of class templates (`Pool<int, 8u>` in the symbol table vs. `Pool<int, 8>` in the debug information). When an expression that is just a symbol name fails, in the Variables panel, Watch, Hover or Live Watch, we now make gdb search for the symbol and try once more. This is done at most once per symbol.
+* `Break on Value Change` for a static member of a class template failed with `Cannot watch constant value`. Such data breakpoints are now set on the address of the variable, they are not carried over to the next session.
+* BugFix: Statics and globals were not shown at all when `gdbPath` was `gdb-multiarch` and no `objdumpPath` was given. We were looking for a non-existent `objdump-multiarch`.
+* BugFix: A request for static variables that arrived before `nm` was done could wait forever.
+* Known limitation: static locals of a function that only exists inlined (optimized builds) cannot be referenced in gdb from outside of that function. They are listed with a message saying so.
+
 # V1.13.0-pre10
 * BugFix[#1215] liveGDB always disconnects without casuing any execution change in the target (like detach does, implicit or explicit)
 

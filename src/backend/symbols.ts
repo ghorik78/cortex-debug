@@ -8,8 +8,9 @@ import { SymbolType, SymbolScope, SymbolInformation as SymbolInformation } from 
 import { GDBDebugSession } from '../gdb';
 import { hexFormat } from '../frontend/utils';
 import { MINode } from './mi_parse';
+import { getMemberQualifier, gdbExpressionForFileStatic, gdbExpressionsForSymbol, isCompilerGeneratedName } from './cxx_names';
 
-const OBJDUMP_SYMBOL_RE = RegExp(/^([0-9a-f]{8})\s([lg !])([w ])([C ])([W ])([I ])([dD ])([FfO ])\s(.*?)\t([0-9a-f]+)\s(.*)$/);
+const OBJDUMP_SYMBOL_RE = RegExp(/^([0-9a-f]{8})\s([lgu !])([w ])([C ])([W ])([I ])([dD ])([FfO ])\s(.*?)\t([0-9a-f]+)\s(.*)$/);
 const NM_SYMBOL_RE = RegExp(/^([0-9a-f]+).*\t(.+):[0-9]+/);     // For now, we only need two things
 const debugConsoleLogging = false;
 const TYPE_MAP: { [id: string]: SymbolType } = {
@@ -22,6 +23,7 @@ const TYPE_MAP: { [id: string]: SymbolType } = {
 const SCOPE_MAP: { [id: string]: SymbolScope } = {
     'l': SymbolScope.Local,
     'g': SymbolScope.Global,
+    'u': SymbolScope.Global,        // Unique global. A GNU extension, used in place of weak symbols by some toolchains
     ' ': SymbolScope.Neither,
     '!': SymbolScope.Both
 };
@@ -139,6 +141,14 @@ export class SymbolTable {
     private globalVars: SymbolInformation[] = [];
     private globalFuncsMap: { [key: string]: SymbolInformation } = {};    // Key is function name
     private staticVars: SymbolInformation[] = [];
+    // C++ variables that can be defined in many object files and the linker keeps one: inline variables (which
+    // includes static inline class members), static members of class templates, variable templates and statics
+    // in inline/template functions. They are not locals. They are not proper globals in the symbol table either
+    private weakVars: SymbolInformation[] = [];
+    private weakVarsWithDebugInfo: SymbolInformation[] = null;      // Subset of weakVars that we can show. Created on demand
+    private allGlobalVars: SymbolInformation[] = null;              // globalVars + weakVarsWithDebugInfo. Created on demand
+    private varsByQualifier: Map<string, SymbolInformation[]> = null;   // Created on demand. Key is 'ns::Class' for a 'ns::Class::var'
+    private symbolsWithDebugFile = new Set<SymbolInformation>();    // Symbols where nm found a source file from the debug info
     private staticFuncsMap: { [key: string]: SymbolInformation[] } = {};  // Key is function name
     private fileMap: { [key: string]: string[] } = {};                    // Potential list of file aliases we found
     public symbolsAsIntervalTree: IntervalTree<SymbolNode> = new IntervalTree<SymbolNode>();
@@ -156,7 +166,8 @@ export class SymbolTable {
             this.objdumpPath = os.platform() !== 'win32' ? `${args.toolchainPrefix}-objdump` : `${args.toolchainPrefix}-objdump.exe`;
             if (args.toolchainPath) {
                 this.objdumpPath = path.normalize(path.join(args.toolchainPath, this.objdumpPath));
-            } else if (args.gdbPath) {
+            } else if (args.gdbPath && !/gdb-multiarch(\.exe)?$/i.test(args.gdbPath)) {
+                // gdb-multiarch is not part of a toolchain, there is no 'objdump-multiarch' next to it
                 const tmp = replaceProgInPath(args.gdbPath, /gdb/i, 'objdump');
                 this.objdumpPath = tmp || this.objdumpPath;
             }
@@ -355,6 +366,7 @@ export class SymbolTable {
                 section: secName,
                 length: size,
                 isStatic: (scope === SymbolScope.Local) && cxt.curObjFile ? true : false,
+                isWeak: (match[3] === 'w') || (match[2] === 'u'),
                 instructions: null,
                 hidden: hidden
             };
@@ -501,6 +513,7 @@ export class SymbolTable {
                     if (syms) {
                         for (const sym of syms) {
                             sym.file = item[1];
+                            this.symbolsWithDebugFile.add(sym);
                         }
                     } else {
                         console.error('Unknown symbol address. Need to investigate', hexFormat(item[0]), item);
@@ -511,6 +524,7 @@ export class SymbolTable {
             } finally {
                 this.addressToFileOrig.clear();
                 this.nmPromises = [];
+                resolve();
             }
         });
         return this.finishNmSymbolsPromise;
@@ -538,18 +552,22 @@ export class SymbolTable {
 
     private sortGlobalVars() {
         // We only sort globalVars. Want to preserve statics original order though.
-        this.globalVars.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
+        this.globalVars = SymbolTable.sortGlobals(this.globalVars);
+    }
+
+    private static sortGlobals(vars: SymbolInformation[]): SymbolInformation[] {
+        vars.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
 
         // double underscore variables are less interesting. Push it down to the bottom
         const doubleUScores: SymbolInformation[] = [];
-        while (this.globalVars.length > 0) {
-            if (this.globalVars[0].name.startsWith('__')) {
-                doubleUScores.push(this.globalVars.shift());
+        while (vars.length > 0) {
+            if (vars[0].name.startsWith('__')) {
+                doubleUScores.push(vars.shift());
             } else {
                 break;
             }
         }
-        this.globalVars = this.globalVars.concat(doubleUScores);
+        return vars.concat(doubleUScores);
     }
 
     private categorizeSymbols() {
@@ -561,13 +579,14 @@ export class SymbolTable {
                     sym.scope = SymbolScope.Global;
                     this.globalFuncsMap[sym.name] = sym;
                 } else if (type === SymbolType.Object) {
-                    if (scope === SymbolScope.Global) {
+                    if (sym.isWeak) {
+                        // C++ generates lots of these and many (vtables, typeinfo, etc.) fail gdb create-vars. We can
+                        // only tell which ones are real variables once nm is done. See getWeakVariables()
+                        this.weakVars.push(sym);
+                    } else if (scope === SymbolScope.Global) {
                         this.globalVars.push(sym);
-                    } else {
-                        // These fail gdb create-vars. So ignoring them. C++ generates them.
-                        if (debugConsoleLogging) {
-                            console.log('SymbolTable: ignoring non local object: ' + sym.name);
-                        }
+                    } else if (debugConsoleLogging) {
+                        console.log('SymbolTable: ignoring non local object: ' + sym.name);
                     }
                 }
             } else if (sym.file) {
@@ -700,6 +719,86 @@ export class SymbolTable {
         return this.globalVars;
     }
 
+    // Weak variables that have debug info, so gdb has a chance of showing them. Call only after nm is done
+    private getWeakVariables(): SymbolInformation[] {
+        if (!this.weakVarsWithDebugInfo) {
+            this.weakVarsWithDebugInfo = this.weakVars.filter((s) => this.symbolsWithDebugFile.has(s) && !isCompilerGeneratedName(s.name));
+        }
+        return this.weakVarsWithDebugInfo;
+    }
+
+    // Same as getGlobalVariables() but includes C++ variables with weak linkage like static inline members
+    // and static members of class templates. Has to wait for nm to tell us which ones are real variables
+    public async getAllGlobalVariables(): Promise<SymbolInformation[]> {
+        await this.finishNmSymbols();
+        if (!this.allGlobalVars) {
+            const weak = this.getWeakVariables();
+            this.allGlobalVars = (weak.length > 0) ? SymbolTable.sortGlobals(this.globalVars.concat(weak)) : this.globalVars;
+        }
+        return this.allGlobalVars;
+    }
+
+    // Variables that are members of the given class (static data members), no matter how they are linked
+    private getClassVariables(qualifier: string): SymbolInformation[] {
+        if (!this.varsByQualifier) {
+            this.varsByQualifier = new Map<string, SymbolInformation[]>();
+            for (const sym of [...this.globalVars, ...this.getWeakVariables(), ...this.staticVars]) {
+                const key = getMemberQualifier(sym.name);
+                if (key) {
+                    const syms = this.varsByQualifier.get(key);
+                    if (syms) {
+                        syms.push(sym);
+                    } else {
+                        this.varsByQualifier.set(key, [sym]);
+                    }
+                }
+            }
+            for (const syms of this.varsByQualifier.values()) {
+                syms.sort((a, b) => a.name.localeCompare(b.name));
+            }
+        }
+        return this.varsByQualifier.get(qualifier) || [];
+    }
+
+    public async hasVariablesWithQualifier(qualifier: string): Promise<boolean> {
+        await this.finishNmSymbols();
+        return this.getClassVariables(qualifier).length > 0;
+    }
+
+    /**
+     * What we show in the 'Static' scope when stopped in a given source file. In this order
+     * 1. Static members of the class we are in, if any. They can be defined in any file
+     * 2. Variables with a local linkage that belong to the file: what C calls a static variable
+     * 3. C++ variables with weak linkage that are defined in the file (see weakVars). They are also found among
+     *    the globals but this is where you find them when debugging templates/inline functions living in a header
+     */
+    public async getStaticScopeVariables(file: string, classQualifier?: string): Promise<SymbolInformation[]> {
+        await this.finishNmSymbols();
+        // Names must be unique in a scope. They may not be, for instance, when a header that defines a static
+        // variable is used by several source files: each gets its own, all coming from the same file
+        const ret = new Map<string, SymbolInformation>();
+        const classVars = classQualifier ? this.getClassVariables(classQualifier) : [];
+        for (const sym of [...classVars, ...this.getStaticVariables(file), ...this.getWeakVariablesInFile(file)]) {
+            if (!ret.has(sym.name)) {
+                ret.set(sym.name, sym);
+            }
+        }
+        return Array.from(ret.values());
+    }
+
+    /**
+     * Returns gdb expressions for a global or static variable. More than one if we are not sure how gdb can find
+     * it and the caller has to try them in order.
+     */
+    public getGdbExpressions(sym: SymbolInformation, frameFile?: string): string[] {
+        if ((sym.scope === SymbolScope.Local) && sym.file) {
+            // Preferably, the file is given the same way gdb reports it
+            const file = frameFile && this.symbolBelongsToFile(sym, frameFile) ? frameFile : sym.file as string;
+            return [gdbExpressionForFileStatic(sym.name, file)];
+        }
+        return gdbExpressionsForSymbol(sym.name, this.symbolsWithDebugFile.has(sym) ? sym.file as string : undefined);
+    }
+
     public async getStaticVariableNames(file: string): Promise<string[]> {
         if (this.varsByFile) {
             const nfile = SymbolTable.NormalizePath(file);
@@ -715,6 +814,15 @@ export class SymbolTable {
         return ret;
     }
 
+    private symbolBelongsToFile(s: SymbolInformation, file: string, nfile?: string): boolean {
+        nfile = nfile || SymbolTable.NormalizePath(file);
+        if ((s.file === nfile) || (s.file === file)) {
+            return true;
+        }
+        const maps = this.fileMap[s.file];
+        return !!maps && ((maps.indexOf(nfile) !== -1) || (maps.indexOf(file) !== -1));
+    }
+
     public getStaticVariables(file: string): SymbolInformation[] {
         if (!file) {
             return [];
@@ -722,20 +830,23 @@ export class SymbolTable {
         const nfile = SymbolTable.NormalizePath(file);
         let ret = this.staticsByFile[file];
         if (!ret) {
-            ret = [];
-            for (const s of this.staticVars) {
-                if ((s.file === nfile) || (s.file === file)) {
-                    ret.push(s);
-                } else {
-                    const maps = this.fileMap[s.file];
-                    if (maps && (maps.indexOf(nfile) !== -1)) {
-                        ret.push(s);
-                    } else if (maps && (maps.indexOf(file) !== -1)) {
-                        ret.push(s);
-                    }
-                }
-            }
+            ret = this.staticVars.filter((s) => this.symbolBelongsToFile(s, file, nfile));
             this.staticsByFile[file] = ret;
+        }
+        return ret;
+    }
+
+    private weakVarsByFile: { [file: string]: SymbolInformation[] } = {};
+    private getWeakVariablesInFile(file: string): SymbolInformation[] {
+        if (!file) {
+            return [];
+        }
+        let ret = this.weakVarsByFile[file];
+        if (!ret) {
+            const nfile = SymbolTable.NormalizePath(file);
+            ret = this.getWeakVariables().filter((s) => this.symbolBelongsToFile(s, file, nfile));
+            ret.sort((a, b) => a.name.localeCompare(b.name));
+            this.weakVarsByFile[file] = ret;
         }
         return ret;
     }
